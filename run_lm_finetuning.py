@@ -36,7 +36,8 @@ from transformers import (WEIGHTS_NAME, AdamW,
                                   DistilBertConfig, DistilBertForMaskedLM, DistilBertTokenizer)
 
 # WarmupLinearSchedule
-from transformers import get_linear_schedule_with_warmup
+# from transformers import get_linear_schedule_with_warmup
+from transformers import WarmupLinearSchedule
 
 
 logger = logging.getLogger(__name__)
@@ -58,22 +59,26 @@ class TextDataset(Dataset):
         directory, filename = os.path.split(file_path)
         cached_features_file = os.path.join(directory, args.model_name_or_path + '_cached_lm_' + str(block_size) + '_' + filename)
 
+        # 如果存在 cache 则不需要生成
         if os.path.exists(cached_features_file) and not args.overwrite_cache:
             logger.info("Loading features from cached file %s", cached_features_file)
             with open(cached_features_file, 'rb') as handle:
                 self.examples = pickle.load(handle)
+        # 不存在 cache 生成
         else:
             logger.info("Creating features from dataset file at %s", directory)
 
             self.examples = []
             with open(file_path, encoding="utf-8") as f:
-                # text = f.read()
                 lines = f.readlines()
                 if train:
+                    # 训练的时候最大问题和选项长度由数据集决定
                     self.max_q_len, self.max_a_len, tokenized_lines = self.get_max_length(lines, tokenizer)
                 else:
+                    # 评估的时候最大长度由人设定
                     self.max_q_len, self.max_a_len = max_q_length, max_a_length
                     _, _, tokenized_lines = self.get_max_length(lines, tokenizer)
+                
                 for line in tokenized_lines:
                     q, a = line[0], line[1]
                     if len(q)<self.max_q_len:
@@ -101,14 +106,19 @@ class TextDataset(Dataset):
         max_a_len = -1
         result = []
         for line in lines:
+            # ['at the beach, one thing that might protect you from sun is', 'umbrella.']
             parts = line.strip().split('\t')
             question, answer = parts[0], parts[1]
+            # [265, 262, 10481, 11, 530, 1517, 326, 1244, 1805, 345, 422, 4252, 318]
             tokenized_question = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(question))
+            # [2178, 20481, 13]
             tokenized_answer = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(answer))
+            # 记录最大的question长度 和最大的answer长度
             if len(tokenized_question)> max_q_len:
                 max_q_len = len(tokenized_question)
             if len(tokenized_answer)> max_a_len:
                 max_a_len = len(tokenized_answer)
+            # 记录当前case
             result.append((tokenized_question, tokenized_answer))
         return max_q_len, max_a_len, result
 
@@ -164,6 +174,7 @@ def _rotate_checkpoints(args, checkpoint_prefix, use_mtime=False):
 
 def mask_tokens(inputs, tokenizer, args):
     """ Prepare masked tokens inputs/labels for masked language modeling: 80% MASK, 10% random, 10% original. """
+    
     labels = inputs.clone()
     # We sample a few tokens in each sequence for masked-LM training (with probability args.mlm_probability defaults to 0.15 in Bert/RoBERTa)
     probability_matrix = torch.full(labels.shape, args.mlm_probability)
@@ -207,9 +218,9 @@ def train(args, train_dataset, model, tokenizer):
         {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
         ]
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
-    
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=t_total)
-    # scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
+
+    # scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=t_total)
+    scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
     if args.fp16:
         try:
             from apex import amp
@@ -247,15 +258,18 @@ def train(args, train_dataset, model, tokenizer):
         for step, batch in enumerate(epoch_iterator):
             # pdb.set_trace()
             batch_inputs = batch
+            # [q,q,q,q,pad,pad,pad,a,a,a,pad,pad,pad]
             batch_labels = batch
+            # [q,q,q,q,-1,-1,-1,a,a,a,-1,-1,-1]
             batch_labels = torch.where(batch_labels==tokenizer.convert_tokens_to_ids('<PAD>'),torch.ones_like(batch).fill_(-1), batch_labels)
+            # 问题的部分全部赋 -1
             batch_labels[:, :train_dataset.max_q_len] = -1
-            # pdb.set_trace()
+
             inputs, labels = mask_tokens(batch, tokenizer, args) if args.mlm else (batch_inputs, batch_labels)
             inputs = inputs.to(args.device)
             labels = labels.to(args.device)
-            # pdb.set_trace()
             model.train()
+            # pdb.set_trace()
             outputs = model(inputs, masked_lm_labels=labels) if args.mlm else model(inputs, labels=labels)
             # pdb.set_trace()
             loss = outputs[0]  # model outputs are always tuple in transformers (see doc)
@@ -285,7 +299,7 @@ def train(args, train_dataset, model, tokenizer):
                 if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
                     # Log metrics
                     if args.local_rank == -1 and args.evaluate_during_training:  # Only evaluate when single GPU otherwise metrics may not average well
-                        results = evaluate(args, model, tokenizer)
+                        results = evaluate(args, model, tokenizer, max_q = train_dataset.max_q_len , max_a = train_dataset.max_a_len)
                         for key, value in results.items():
                             tb_writer.add_scalar('eval_{}'.format(key), value, global_step)
                     tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
@@ -319,6 +333,9 @@ def train(args, train_dataset, model, tokenizer):
 
 
 def evaluate(args, model, tokenizer, prefix="", max_q = None, max_a = None):
+    '''
+    评估部分
+    '''
     # Loop to handle MNLI double evaluation (matched, mis-matched)
     eval_output_dir = args.output_dir
 
@@ -528,15 +545,15 @@ def main():
                                         cache_dir=args.cache_dir if args.cache_dir else None)
     model.to(args.device)
 
-    #add padding token to gpt2
+    # 增加 <PAD> token 到GPT2
     special_tokens_dict = {'pad_token': '<PAD>'}
 
     num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)
     print('We have added', num_added_toks, 'tokens')
+    # 改变tokenembedding的大小  即改变此表大小
     model.resize_token_embeddings(len(tokenizer))  # Notice: resize_token_embeddings expect to receive the full size of the new vocabulary, i.e. the length of the tokenizer.
 
     assert tokenizer.pad_token == '<PAD>'
-    #add padding token to gpt2
 
     if args.local_rank == 0:
         torch.distributed.barrier()  # End of barrier to make sure only the first process in distributed training download model & vocab
